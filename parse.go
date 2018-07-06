@@ -146,7 +146,7 @@ func ParseSchema(directory string) ([]Table, error) {
 		if err != nil {
 			return nil, fmt.Errorf(
 				"Error parsing column type on line %d: %v",
-				i+1,
+				i+2, // 1 for the zero-indexing and 1 for the header line
 				err,
 			)
 		}
