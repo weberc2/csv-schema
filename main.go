@@ -1,13 +1,20 @@
 package main
 
 import (
+	"encoding/json"
+	"io/ioutil"
 	"log"
 )
 
 func main() {
-	schema, err := ParseSchema(".")
+	data, err := ioutil.ReadFile("./schema.json")
 	if err != nil {
-		log.Fatal("Failed to parse schema:", err)
+		log.Fatal(err)
+	}
+
+	var schema []TableSpec
+	if err := json.Unmarshal(data, &schema); err != nil {
+		log.Fatal(err)
 	}
 
 	if err := Validate(FileSystemRepo{"."}, schema); err != nil {

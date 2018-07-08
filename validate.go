@@ -5,210 +5,240 @@ import (
 	"strings"
 )
 
-func notNullCheck(value string) error {
-	if value == "" {
-		return fmt.Errorf("Found null value in not-null column")
-	}
-	return nil
+type tableChecker struct {
+	TableSpec
+	pkeyCols []int
 }
 
-func makeUniqueCheck() func(string) error {
-	seen := make(map[string]struct{})
-	return func(value string) error {
-		if _, found := seen[value]; found {
-			return fmt.Errorf("Found duplicate value in unique column")
+type schemaChecker map[TableName]tableChecker
+
+func checkSchemaConsistency(schema []TableSpec) (schemaChecker, error) {
+	// Schema checks
+	// [x] Table names are unique
+	// [x] Column names are unique
+	// [x] Primary key columns exist
+	// [x] Unique columns exist
+	// [x] Foreign key local and remote columns exist
+	// [x] Foreign key remote columns are primary keys
+	// [x] Foreign key local and remote columns have matching types
+
+	tableCheckers := map[TableName]tableChecker{}
+	for _, table := range schema {
+		// The table name is unique
+		if _, found := tableCheckers[table.Name]; found {
+			return nil, fmt.Errorf("Table exists: '%s'", table.Name)
 		}
-		seen[value] = struct{}{}
-		return nil
-	}
-}
+		tableCheckers[table.Name] = tableChecker{TableSpec: table}
 
-func Validate(repo Repo, tables []Table) error {
-	// Schema-only checks
-	// ==================
-	// [x] Table names are unique in a schema
-	// [x] Column names are unique in a table
-	// [x] Table names are valid (not-empty)
-	// [x] Column names are valid (not-empty)
-	// [x] Only one primary key column per table
-	// [x] Foreign key constraints reference primary key columns
-
-	// Schema+headers checks
-	// =====================
-	// [x] All columns exist in file
-
-	// Schema+data checks
-	// ==================
-	// [x] Each row of the data has the correct number of columns
-	// [x] Data for each column is correctly-typed
-	// [x] Primary key column data is unique and null-free
-	// [x] Unique column data is unique
-	// [x] Not-null column data is null-free
-	// [ ] Foreign key values exist in the foreign column
-
-	// Make sure table names are unique and valid
-	tableNames := map[string]struct{}{}
-	for _, table := range tables {
-		if table.Name == "" {
-			return fmt.Errorf("Invalid table name: ''")
-		}
-
-		if _, found := tableNames[table.Name]; found {
-			return fmt.Errorf("Table name exists: '%s'", table.Name)
-		}
-		tableNames[table.Name] = struct{}{}
-	}
-
-	// Make sure column names are unique within a table and each table has at
-	// most one primary key column
-	for _, table := range tables {
-		columnNames := map[string]struct{}{}
-		primaryKeyColumns := []string{}
+		// Column names are unique
+		columns := map[ColumnName]ColumnSpec{}
 		for _, column := range table.Columns {
-			if column.Name == "" {
-				return fmt.Errorf("Invalid column name: '%s'.''", table.Name)
-			}
-			if column.PrimaryKey {
-				primaryKeyColumns = append(primaryKeyColumns, column.Name)
-			}
-			if column.References != nil {
-				for _, foreignTable := range tables {
-					if foreignTable.Name == column.References.Table {
-						for _, foreignColumn := range foreignTable.Columns {
-							if foreignColumn.Name == column.References.Column {
-								goto DONE
-							}
-						}
-						return fmt.Errorf(
-							"Column '%s'.'%s' references '%s'.'%s'; "+
-								"found table, but column is missing from "+
-								"the table's schema",
-							table.Name,
-							column.Name,
-							column.References.Table,
-							column.References.Column,
-						)
-					}
-				}
-				return fmt.Errorf(
-					"Column '%s'.'%s' references table '%s' but it is "+
-						"missing from the schema",
-					table.Name,
-					column.Name,
-					column.References.Table,
-				)
-			DONE:
-			}
-
-			if _, found := columnNames[column.Name]; found {
-				return fmt.Errorf(
-					"Column name exists: '%s'.'%s'",
+			if _, found := columns[column.Name]; found {
+				return nil, fmt.Errorf(
+					"Column exists: '%s'.'%s'",
 					table.Name,
 					column.Name,
 				)
 			}
-			columnNames[column.Name] = struct{}{}
+			columns[column.Name] = column
 		}
 
-		if len(primaryKeyColumns) > 1 {
-			for i, name := range primaryKeyColumns {
-				primaryKeyColumns[i] = "'" + name + "'"
+		// Primary key columns exist
+		pkeyCols := make([]int, 0, 10)
+	OUTER:
+		for pkey := table.PrimaryKey; pkey != nil; pkey = pkey.Tail {
+			for i, column := range table.Columns {
+				if column.Name == pkey.Name {
+					pkeyCols = append(pkeyCols, i)
+					continue OUTER
+				}
 			}
-			return fmt.Errorf(
-				"Multiple primary key columns in table '%s': %s",
+			return nil, fmt.Errorf(
+				"Primary key column not found: '%s'.'%s'",
 				table.Name,
-				strings.Join(primaryKeyColumns, ", "),
+				pkey.Name,
 			)
 		}
+		tableChecker := tableCheckers[table.Name]
+		tableChecker.pkeyCols = pkeyCols
+		tableCheckers[table.Name] = tableChecker
+
+		// Unique columns exist
+		for _, column := range table.UniqueColumns {
+			for cs := &column; cs != nil; cs = cs.Tail {
+				if _, found := columns[cs.Name]; !found {
+					return nil, fmt.Errorf(
+						"Column not found for unique constraint: '%s'.'%s'",
+						table.Name,
+						cs.Name,
+					)
+				}
+			}
+		}
+
+		// Validate foreign keys
+		for _, mapping := range table.ForeignKeys {
+			if err := checkForeignKey(
+				table,
+				mapping,
+				tableCheckers,
+			); err != nil {
+				return nil, err
+			}
+		}
 	}
 
-	for _, table := range tables {
-		if err := repo.WithTable(table.Name, func(rows Rows) error {
-			// Make sure referenced columns exist in repo
+	return tableCheckers, nil
+}
+
+type Set map[string]Set
+
+func (s Set) Exists(ss []string) bool {
+	if len(ss) < 1 {
+		return false
+	}
+	next, found := s[ss[0]]
+	return found && next.Exists(ss[1:])
+}
+
+func (s Set) Put(ss []string) {
+	if len(ss) < 1 {
+		return
+	}
+	next, found := s[ss[0]]
+	if !found {
+		next = Set{}
+		s[ss[0]] = next
+	}
+	next.Put(ss[1:])
+}
+
+func Validate(repo Repo, schema []TableSpec) error {
+	tableCheckers, err := checkSchemaConsistency(schema)
+	if err != nil {
+		return err
+	}
+
+	// Data checks
+	// [x] Columns exist in data
+	// [x] Columns are ordered according to the schema
+	// [x] Each row has the proper number of cells
+	// [x] Primary key columns are unique
+	// [ ] Primary key columns are null-free (does this hold for every column
+	//	   in a composite key?)
+	// [x] Column values are properly typed
+	// [x] Not-null columns are null-free
+	// [ ] Unique columns are unique
+	// [ ] Foreign key values exist in remote columns
+
+	for _, table := range schema {
+		if err := repo.WithTable(string(table.Name), func(rows Rows) error {
 			if len(table.Columns) != len(rows.Headers) {
 				return fmt.Errorf(
-					"Column number mismatch; wanted %d columns, found %d",
+					"Mismatched number of schema columns vs data columns "+
+						"in table '%s': %d schema columns vs %d data columns",
+					table.Name,
 					len(table.Columns),
 					len(rows.Headers),
 				)
 			}
-
-			type _column struct {
-				name        string
-				valueChecks []func(string) error
-			}
-
-			// Check that all column names have corresponding headers.
-			columnsByHeader := make([]_column, len(table.Columns))
-		OUTER:
-			for _, column := range table.Columns {
-				for headerNumber, header := range rows.Headers {
-					if column.Name == header {
-						c := _column{
-							name: column.Name,
-							valueChecks: []func(string) error{
-								column.Type.ValidateDataType,
-							},
-						}
-						if column.PrimaryKey {
-							c.valueChecks = append(
-								c.valueChecks,
-								makeUniqueCheck(),
-								notNullCheck,
-							)
-						} else {
-							if column.Unique {
-								c.valueChecks = append(
-									c.valueChecks,
-									makeUniqueCheck(),
-								)
-							}
-							if column.NotNull {
-								c.valueChecks = append(
-									c.valueChecks,
-									notNullCheck,
-								)
-							}
-						}
-						columnsByHeader[headerNumber] = c
-						continue OUTER
-					}
-				}
-				// If we get here, then we didn't find a corresponding header
-				// for the schema column; return an error
-				return fmt.Errorf(
-					"Column not found: '%s'.'%s'",
-					table.Name,
-					column.Name,
-				)
-			}
-
-			// For each row in the data...
-			for lineNumber := 1; rows.Next(); lineNumber++ {
-				// ...make sure the row has the correct number of columns
-				if len(rows.CurrentRow) != len(table.Columns) {
+			for i, column := range table.Columns {
+				if rows.Headers[i] != string(column.Name) {
 					return fmt.Errorf(
-						"Column count mismatch at line %d: wanted %d "+
-							"columns, found %d",
-						lineNumber,
-						len(table.Columns),
-						len(rows.CurrentRow),
+						"Column %d in table '%s' should be '%s', but got '%s'",
+						i,
+						table.Name,
+						column.Name,
+						rows.Headers[i],
 					)
 				}
+			}
 
-				// ...validate the row's values
-				for headerNumber, value := range rows.CurrentRow {
-					c := columnsByHeader[headerNumber]
-					for _, check := range c.valueChecks {
-						if err := check(value); err != nil {
+			var rowChecks []func(row []string) error
+			rowChecks = append(
+				rowChecks,
+				func(row []string) error {
+					if len(row) != len(table.Columns) {
+						return fmt.Errorf(
+							"Wrong number of cells; wanted %d, got %d",
+							len(table.Columns),
+							len(row),
+						)
+					}
+					return nil
+				},
+				func(row []string) error {
+					for i, column := range table.Columns {
+						if err := ValidateDataType(
+							column.Type,
+							row[i],
+						); err != nil {
 							return fmt.Errorf(
-								"'%s'.'%s' line %d: %v",
-								table.Name,
-								c.name,
-								lineNumber,
+								"Type error in column %d:",
+								i,
 								err,
 							)
 						}
+					}
+					return nil
+				},
+			)
+
+			notNullColumns := make([]struct {
+				name  ColumnName
+				colID int
+			}, 0, 10)
+			for i, column := range table.Columns {
+				if column.NotNull {
+					notNullColumns = append(notNullColumns, struct {
+						name  ColumnName
+						colID int
+					}{column.Name, i})
+				}
+			}
+			if len(notNullColumns) > 0 {
+				rowChecks = append(rowChecks, func(row []string) error {
+					for _, col := range notNullColumns {
+						if row[col.colID] == "" {
+							return fmt.Errorf(
+								"Null value found in not-null column '%s'",
+								col.name,
+							)
+						}
+					}
+					return nil
+				})
+			}
+
+			if table.PrimaryKey != nil {
+				seen := Set{}
+				pkeyCols := tableCheckers[table.Name].pkeyCols
+				buf := make([]string, len(pkeyCols))
+				rowChecks = append(rowChecks, func(row []string) error {
+					for i, colID := range pkeyCols {
+						buf[i] = row[colID]
+					}
+					if seen.Exists(buf) {
+						return fmt.Errorf(
+							"Duplicate value found for primary key column: "+
+								"(%s)",
+							strings.Join(buf, ", "),
+						)
+					}
+					seen.Put(buf)
+					return nil
+				})
+			}
+
+			for i := 2; rows.Next(); i++ {
+				for _, check := range rowChecks {
+					if err := check(rows.CurrentRow); err != nil {
+						return fmt.Errorf(
+							"Error in table '%s' row %d: %v",
+							table.Name,
+							i,
+							err,
+						)
 					}
 				}
 			}
@@ -216,6 +246,126 @@ func Validate(repo Repo, tables []Table) error {
 			return nil
 		}); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func findSpecs(column Column, table TableSpec) ([]ColumnSpec, error) {
+	specs := make([]ColumnSpec, 0, column.Len())
+OUTER:
+	for c := &column; c != nil; c = c.Tail {
+		for _, spec := range table.Columns {
+			if c.Name == spec.Name {
+				specs = append(specs, spec)
+				continue OUTER
+			}
+		}
+		return nil, fmt.Errorf(
+			"Column '%s' not found on table '%s'",
+			c.Name,
+			table.Name,
+		)
+	}
+	return specs, nil
+}
+
+func checkForeignKey(
+	table TableSpec,
+	fkm ForeignKeyMapping,
+	tableCheckers map[TableName]tableChecker,
+) error {
+	if fkm.LocalColumn.Len() != fkm.ForeignColumn.Len() {
+		return fmt.Errorf(
+			"Mismatched foreign key tuple size: %s vs %s",
+			fkm.LocalColumn,
+			fkm.ForeignColumn,
+		)
+	}
+
+	foreignTable, found := tableCheckers[fkm.ForeignTable]
+	if !found {
+		return fmt.Errorf(
+			"Table not found for foreign key: '%s'",
+			fkm.ForeignTable,
+		)
+	}
+
+	// Make sure all foreign key columns exist, are primary keys, and have the
+	// right types.
+	if foreignTable.PrimaryKey == nil {
+		return fmt.Errorf(
+			"Foreign key column in table '%s' references a column in table "+
+				"'%s', but '%s' has no primary key. Foreign keys must map to "+
+				"primary key columns. Foreign key column must be the primary "+
+				"key of the foreign table",
+			table.Name,
+			foreignTable.Name,
+		)
+	}
+
+	// Make sure the foreign column is the primary key of the foreign table
+	if !fkm.ForeignColumn.Equal(*foreignTable.PrimaryKey) {
+		return fmt.Errorf(
+			"Foreign key isn't the primary key on the foreign table: "+
+				"(foreign key column: %s) "+
+				"(foreign table's primary key column: %s)",
+			fkm.ForeignColumn,
+			foreignTable.PrimaryKey,
+		)
+	}
+
+	// Find the local column specs for the local column
+	localSpecs, err := findSpecs(fkm.LocalColumn, table)
+	if err != nil {
+		return fmt.Errorf(
+			"%s but it is referenced in the table's foreign keys",
+			err.Error(),
+		)
+	}
+
+	// Grab the foreign column types
+	foreignSpecs, err := findSpecs(fkm.ForeignColumn, foreignTable.TableSpec)
+	if err != nil {
+		return fmt.Errorf(
+			"%s but it is referenced in a foreign key in table '%s'",
+			err.Error(),
+			table.Name,
+		)
+	}
+
+	// Make sure the foreign table types match with the local table types
+	if len(foreignSpecs) != len(localSpecs) {
+		return fmt.Errorf(
+			"Foreign key column count mismatch; column '%s'.%s references "+
+				"'%s'.%s; local column had %d columns but foreign column has "+
+				"%d columns",
+			table.Name,
+			fkm.LocalColumn,
+			foreignTable.Name,
+			fkm.ForeignColumn,
+			len(localSpecs),
+			len(foreignSpecs),
+		)
+	}
+	for i, foreignSpec := range foreignSpecs {
+		if foreignSpec.Type != localSpecs[i].Type {
+			localTypeStrings := make([]string, len(localSpecs))
+			foreignTypeStrings := make([]string, len(foreignSpecs))
+			for i, spec := range localSpecs {
+				localTypeStrings[i] = string(spec.Type)
+				foreignTypeStrings[i] = string(foreignSpecs[i].Type)
+			}
+			return fmt.Errorf(
+				"Foreign key column type mismatch; column '%s'.%s with type"+
+					"%s references '%s'.%s with type %s",
+				table.Name,
+				fkm.LocalColumn,
+				"("+strings.Join(localTypeStrings, ", ")+")",
+				foreignTable.Name,
+				fkm.ForeignColumn,
+				"("+strings.Join(foreignTypeStrings, ", ")+")",
+			)
 		}
 	}
 
