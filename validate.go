@@ -91,26 +91,45 @@ func checkSchemaConsistency(schema []TableSpec) (schemaChecker, error) {
 	return tableCheckers, nil
 }
 
-type Set map[string]Set
+type set map[string]set
 
-func (s Set) Exists(ss []string) bool {
+func (s set) Exists(ss []string) bool {
 	if len(ss) < 1 {
-		return false
+		return true
 	}
 	next, found := s[ss[0]]
 	return found && next.Exists(ss[1:])
 }
 
-func (s Set) Put(ss []string) {
+func (s set) Put(ss []string) {
 	if len(ss) < 1 {
 		return
 	}
 	next, found := s[ss[0]]
 	if !found {
-		next = Set{}
+		next = set{}
 		s[ss[0]] = next
 	}
 	next.Put(ss[1:])
+}
+
+func makeUniqueCheck(uniqueColumns []int) func([]string) error {
+	seen := set{}
+	buf := make([]string, len(uniqueColumns))
+	return func(row []string) error {
+		for i, colID := range uniqueColumns {
+			buf[i] = row[colID]
+		}
+		if seen.Exists(buf) {
+			return fmt.Errorf(
+				"Duplicate value found for unique column: "+
+					"(%s)",
+				strings.Join(buf, ", "),
+			)
+		}
+		seen.Put(buf)
+		return nil
+	}
 }
 
 func Validate(repo Repo, schema []TableSpec) error {
@@ -128,7 +147,7 @@ func Validate(repo Repo, schema []TableSpec) error {
 	//	   in a composite key?)
 	// [x] Column values are properly typed
 	// [x] Not-null columns are null-free
-	// [ ] Unique columns are unique
+	// [x] Unique columns are unique
 	// [ ] Foreign key values exist in remote columns
 
 	for _, table := range schema {
@@ -184,6 +203,24 @@ func Validate(repo Repo, schema []TableSpec) error {
 				},
 			)
 
+			for _, uniqueColumn := range table.UniqueColumns {
+				var uniqueColumns []int
+			OUTER:
+				for c := &uniqueColumn; c != nil; c = c.Tail {
+					for i, column := range table.Columns {
+						if column.Name == c.Name {
+							uniqueColumns = append(uniqueColumns, i)
+							continue OUTER
+						}
+					}
+					panic(
+						"We shouldn't get here b/c we checked the schema" +
+							"for consistency",
+					)
+				}
+				rowChecks = append(rowChecks, makeUniqueCheck(uniqueColumns))
+			}
+
 			notNullColumns := make([]struct {
 				name  ColumnName
 				colID int
@@ -211,21 +248,14 @@ func Validate(repo Repo, schema []TableSpec) error {
 			}
 
 			if table.PrimaryKey != nil {
-				seen := Set{}
-				pkeyCols := tableCheckers[table.Name].pkeyCols
-				buf := make([]string, len(pkeyCols))
+				check := makeUniqueCheck(tableCheckers[table.Name].pkeyCols)
 				rowChecks = append(rowChecks, func(row []string) error {
-					for i, colID := range pkeyCols {
-						buf[i] = row[colID]
-					}
-					if seen.Exists(buf) {
+					if err := check(row); err != nil {
 						return fmt.Errorf(
-							"Duplicate value found for primary key column: "+
-								"(%s)",
-							strings.Join(buf, ", "),
+							"Duplicate value in primary key column: %s",
+							table.PrimaryKey,
 						)
 					}
-					seen.Put(buf)
 					return nil
 				})
 			}
